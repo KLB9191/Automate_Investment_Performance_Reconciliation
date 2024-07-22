@@ -1,0 +1,862 @@
+import fnmatch
+
+import pandas as pd
+import numpy as np
+from io import StringIO
+
+import sqlalchemy
+from pyxirr import xirr
+import openpyxl
+import os
+import uuid
+import shutil
+from sqlalchemy import create_engine, text
+from datetime import date, datetime, timedelta
+from pathlib import Path
+import pyodbc
+import logging
+import csv
+import glob
+import re
+import subprocess, sys
+
+# loader_check = date.today()
+# loader_check = loader_check.weekday()
+# if loader_check in [0,1,2,3,4]:
+
+
+Current_Enddate = date(2024, 3, 31)
+Previous_Enddate = date(2023, 12, 31)
+Previous_2_Enddate = date(2023, 9, 30)
+Previous_3_Enddate = date(2023, 6, 30)
+
+
+# Setting up SQL database connection for later composite pull:
+pd.options.display.max_columns = None
+server = 'xxx'
+database = 'EnterpriseDatawarehouse'
+driver = 'xxx'
+database_con = f'mssql://@{server}/{database}?driver={driver}'
+
+Current_Fund_Composite = pd.read_sql_query(f"""SELECT [Fund]
+      ,[Issuer]
+      ,[Code_Name]
+      ,[Start_Date]
+      ,PeriodEnding as 'Period_End_Date'
+      ,[Total_Originated_Capital] as 'TOC_Current'
+      ,[Realized_Proceeds]
+      ,[Fair_Market_Value]
+      ,[Total_Value]
+      ,[Gain_Loss] as 'Current_Gain_Loss'
+      ,[Investment_IRR] as 'Current_IRR'
+      ,[Realized]
+      ,[RealizationDate]
+      ,[Gross_Multiple] as 'Current_Gross_Multiple'
+      ,[Cash_Rate] as 'Current_Cash_Yield'
+      ,[Hold_Period]
+
+FROM [EnterpriseDatawarehouse].[xxx]
+
+where PeriodEnding = '{Current_Enddate}';""", database_con)
+
+Current_Borrowers = Current_Fund_Composite[['Fund','Code_Name','Issuer']].copy()
+
+Previous_Fund_Composite_pre = pd.read_sql_query(f"""SELECT [Code_Name]
+      ,[Issuer]
+      ,[Fund]
+      ,[Realized]
+      ,[PeriodEnding]
+      ,[Start_Date]
+      ,[RealizationDate]
+      ,[Fair_Market_Value]
+      ,[Gain_Loss] as 'Previous_Gain_Loss'
+      ,[Gross_Multiple] as 'Previous_Gross_Multiple'
+      ,[Cash_Rate] as 'Previous_Cash_Yield'
+      ,[Investment_IRR] as 'Previous_IRR'
+      ,[Hold_Period]
+      ,[Realized_Proceeds]
+      ,[Total_Originated_Capital] as 'TOC_Previous'
+      ,[Total_Value]
+    
+  FROM [EnterpriseDatawarehouse].[xxx]
+
+  where PeriodEnding = '{Previous_Enddate}';""", database_con)
+
+# Setting up Fund composite recon:
+
+Previous_Fund_Composite = Previous_Fund_Composite_pre.rename(columns = {'Realized_Proceeds':'Previous_Q_RP'})
+Previous_Q = Previous_Fund_Composite[['Fund','Code_Name','Previous_Q_RP','Fair_Market_Value','Previous_Gain_Loss','Previous_IRR','Previous_Gross_Multiple','Previous_Cash_Yield','TOC_Previous']].copy()
+Previous_Q = Previous_Q.rename(columns = {'Fair_Market_Value':'Previous_FMV'})
+Current_Q = Current_Fund_Composite[['Fund','Code_Name', 'Realized_Proceeds','Fair_Market_Value','Realized','Start_Date','RealizationDate','Current_Gain_Loss','Current_IRR','Current_Gross_Multiple',
+                                    'Current_Cash_Yield','TOC_Current']].copy()
+RP_Recon = Current_Q.merge(Previous_Q, how = 'left', on = ['Code_Name', 'Fund'])
+RP_Recon['Previous_Q_RP'] = RP_Recon['Previous_Q_RP'].fillna(0)
+RP_Recon['Previous_FMV'] = RP_Recon['Previous_FMV'].fillna(0)
+RP_Recon['RP_delta'] = RP_Recon['Realized_Proceeds'] - RP_Recon['Previous_Q_RP']
+
+
+# # pulling in repayments, Borrower_Master
+
+Repayments = pd.read_sql_query(f"""SELECT case when Portfolio = 'YS PEER LP' then 'YS PEER'
+		    when Portfolio = 'YS LUX MASTER' then 'YS LUX'
+			when Portfolio = 'WOSPF LP' then 'WOSPF'
+			when Portfolio = 'YS TERM LP' then 'YS ICAV'
+			when Portfolio = 'YS REV LP' then 'YS ICAV'
+			when Portfolio = 'WOS EU REV' then 'WOS EU'
+			when Portfolio = 'WOS EU TERM' then 'WOS EU'
+			when Portfolio = 'WOSF TERM' then 'WOSF'
+			when Portfolio = 'WOSF REV' then 'WOSF'
+			when Portfolio = 'WOSPF II LP' then 'WOSPF II'
+			else Portfolio
+			end as Portfolio
+
+
+      ,[ActualSettlementDate]
+      ,[EventDate]
+      ,[TransactionDesc]
+      ,[Quantity]
+      ,[LocalAmount]
+      ,[BookAmount]
+      ,[InvestmentCode]
+      ,[IssuerDesc]
+      ,[IssuerCode]
+
+  FROM [EnterpriseDatawarehouse].[xxx]
+
+  where eventdate > '{Previous_Enddate}' and EventDate <= '{Current_Enddate}'
+
+  and FinancialAccount = 'OnHand'
+  and IsCreditFacility = '1'
+  and (TransactionDesc = 'DefineGlobal' or
+      TransactionDesc = 'Sell')
+  and IssuerCode <> ''
+;""", database_con)
+#
+Borrower_Master = pd.read_sql_query(f"""SELECT
+      [Code_Name],
+      [Restructured_Code_Name]
+
+  FROM [EnterpriseDatawarehouse].[xxx]
+;""", database_con)
+#
+Borrower_Master = Borrower_Master.rename(columns = {'Code_Name':'IssuerCode'})
+
+Repayments = Repayments.merge(Borrower_Master, how = 'left', on='IssuerCode')
+Repayments['Code_Name_Clean']=np.where(Repayments['Restructured_Code_Name'].notnull(), Repayments['Restructured_Code_Name'],
+                                       Repayments['IssuerCode'])
+
+Repayments = Repayments.drop(columns = ['ActualSettlementDate','TransactionDesc','Quantity','LocalAmount','InvestmentCode','IssuerDesc','IssuerCode','Restructured_Code_Name'])
+Repayments = Repayments.groupby(['Portfolio','Code_Name_Clean']).agg({'BookAmount': 'sum', 'EventDate': 'min'})
+Repayments = Repayments.reset_index()
+Repayments = Repayments.rename(columns = {'BookAmount':'Repayments','EventDate':'Date'})
+Repayments['Repayments'] = Repayments['Repayments']*-1
+
+ # Pulling Buys from investment ledger
+#
+Buys = pd.read_sql_query(f"""SELECT  case when Portfolio = 'YS PEER LP' then 'YS PEER'
+		    when Portfolio = 'YS LUX MASTER' then 'YS LUX'
+			when Portfolio = 'WOSPF LP' then 'WOSPF'
+			when Portfolio = 'YS TERM LP' then 'YS ICAV'
+			when Portfolio = 'YS REV LP' then 'YS ICAV'
+			when Portfolio = 'WOS EU REV' then 'WOS EU'
+			when Portfolio = 'WOS EU TERM' then 'WOS EU'
+			when Portfolio = 'WOSF TERM' then 'WOSF'
+          when Portfolio = 'WOSF REV' then 'WOSF'
+			when Portfolio = 'WOIF' then 'WOI'
+			when Portfolio = 'WOSPF II LP' then 'WOSPF II'
+			else Portfolio
+			end as Portfolio
+      ,[ActualSettlementDate]
+      ,[EventDate]
+      ,[TransactionDesc]
+      ,[Quantity]
+      ,[LocalAmount]
+      ,[BookAmount]
+      ,[InvestmentCode]
+      ,[IssuerDesc]
+      ,[IssuerCode]
+
+      ,[ExtractDate]
+  FROM [EnterpriseDatawarehouse].[xxx]
+
+  where ([TransactionDesc] = 'Buy'
+  or [TransactionDesc] = 'Buy-AddtlFundedTraditional'
+  or [TransactionDesc] = 'Buy-Macquarie'
+  or [TransactionDesc] = 'Buy-Traditional'
+  or [TransactionDesc] = 'Drawdown-Buy'
+  or [TransactionDesc] = 'Drawdown-BuyMacquarie')
+
+  and EventDate > '{Previous_Enddate}'
+  and EventDate <= '{Current_Enddate}'
+  and IssuerCode <> ''
+;""", database_con)
+Buys['IssuerCode'] = Buys['IssuerCode'].replace('MARK2','MARK')
+#
+Buys = Buys.merge(Borrower_Master, how='left', on='IssuerCode')
+Buys['Code Name Clean'] = np.where(Buys['Restructured_Code_Name'] != '',Buys['Restructured_Code_Name'], Buys['IssuerCode'])
+Buys = Buys.drop(columns = {'ActualSettlementDate','TransactionDesc','Quantity','LocalAmount','InvestmentCode','IssuerDesc','IssuerCode','ExtractDate','Restructured_Code_Name'})
+Buys = Buys.groupby(['Portfolio','Code Name Clean']).agg({'BookAmount': 'sum', 'EventDate': 'min'})
+Buys = Buys.reset_index()
+Buys = Buys.rename(columns={'BookAmount':'Buys','EventDate':'Date'})
+
+#
+# Pulling prior quarter taxlot
+#
+Previous_Taxlot = pd.read_sql_query(f"""SELECT case when Fund_Name = 'YS PEER LP' then 'YS PEER'
+		    when Fund_Name = 'YS LUX MASTER' then 'YS LUX'
+			when Fund_Name = 'WOSPF LP' then 'WOSPF'
+			when Fund_Name = 'YS TERM LP' then 'YS ICAV'
+			when Fund_Name = 'YS REV LP' then 'YS ICAV'
+			when Fund_Name = 'WOS EU REV' then 'WOS EU'
+			when Fund_Name = 'WOS EU TERM' then 'WOS EU'
+			when Fund_Name = 'WOSF TERM' then 'WOSF'
+            when Fund_Name = 'WOSF REV' then 'WOSF'
+			when Fund_Name = 'WOIF' then 'WOI'
+			when Fund_Name = 'WOSPF II LP' then 'WOSPF II'
+			when Fund_Name = 'E-OC' then 'OCEP'
+			else Fund_Name
+			end as Portfolio,
+                                        Code_Name as 'IssuerCode',
+                                        Market_Value as 'FMV'
+  FROM [EnterpriseDatawarehouse].[xxx]
+
+  where PeriodEndDate = '{Previous_Enddate}'
+;""", database_con)
+
+Previous_Taxlot = Previous_Taxlot.merge(Borrower_Master, how='left', on='IssuerCode')
+Previous_Taxlot['Code_Name'] = np.where(Previous_Taxlot['Restructured_Code_Name'].notnull(), Previous_Taxlot['Restructured_Code_Name'], Previous_Taxlot['IssuerCode'])
+Previous_Taxlot = Previous_Taxlot.drop(columns = ['IssuerCode','Restructured_Code_Name'])
+Previous_Taxlot = Previous_Taxlot.groupby(['Portfolio','Code_Name'])['FMV'].apply(sum)
+Previous_Taxlot = Previous_Taxlot.reset_index()
+
+
+# Pulling Current Quarter Taxlot
+Current_Taxlot = pd.read_sql_query(f"""SELECT 
+
+ case when Fund_Name = 'YS PEER LP' then 'YS PEER'
+		    when Fund_Name = 'YS LUX MASTER' then 'YS LUX'
+			when Fund_Name = 'WOSPF LP' then 'WOSPF'
+			when Fund_Name = 'YS TERM LP' then 'YS ICAV'
+			when Fund_Name = 'YS REV LP' then 'YS ICAV'
+			when Fund_Name = 'WOS EU REV' then 'WOS EU'
+			when Fund_Name = 'WOS EU TERM' then 'WOS EU'
+			when Fund_Name = 'WOSF TERM' then 'WOSF'
+            when Fund_Name = 'WOSF REV' then 'WOSF'
+			when Fund_Name = 'WOIF' then 'WOI'
+			when Fund_Name = 'WOSPF II LP' then 'WOSPF II'
+			when Fund_Name = 'E-OC' then 'OCEP'
+			else Fund_Name
+			end as Portfolio,
+
+Code_Name as 'IssuerCode', Market_Value as 'FMV'
+  FROM [EnterpriseDatawarehouse].[xxx]
+
+  where PeriodEndDate = '{Current_Enddate}'
+;""", database_con)
+# Current_Taxlot.to_csv(r'xxx', index=False)
+Current_Taxlot = Current_Taxlot.merge(Borrower_Master, how='left', on='IssuerCode')
+Current_Taxlot['Code_Name_'] = np.where(Current_Taxlot['Restructured_Code_Name'].notnull(), Current_Taxlot['Restructured_Code_Name'], Current_Taxlot['IssuerCode'])
+Current_Taxlot['Code_Name'] = np.where(Current_Taxlot['Code_Name_'] == 'MARK2', 'MARK', Current_Taxlot['Code_Name_'])
+Current_Taxlot = Current_Taxlot.drop(columns = ['IssuerCode','Restructured_Code_Name','Code_Name_'])
+Current_Taxlot = Current_Taxlot.groupby(['Portfolio','Code_Name'])['FMV'].apply(sum)
+Current_Taxlot = Current_Taxlot.reset_index()
+Current_Taxlot = Current_Taxlot.rename(columns = {'FMV':'Current_FMV'})
+
+# Current_Taxlot.to_csv(r'xxx.csv', index=False)
+# Creating change in valuation
+#
+Change_in_Valuation = Previous_Taxlot.merge(Current_Taxlot, how = 'left', on = ['Portfolio','Code_Name'])
+Change_in_Valuation['FMV'] = Change_in_Valuation['FMV'].fillna(0)
+Change_in_Valuation['Current_FMV'] = Change_in_Valuation['Current_FMV'].fillna(0)
+Change_in_Valuation['Change_in_FMV'] = Change_in_Valuation['Current_FMV'] - Change_in_Valuation['FMV']
+# Change_in_Valuation.to_csv(r'xxx.csv', index=False)
+
+
+# # Pulling previous quarter AI and creating change in AI
+#
+Previous_AI = pd.read_sql_query(f"""SELECT 
+  case when fund = 'E_GROUP' then 'WO NDT'
+  when fund = 'WOSPF II LP' then 'WOSPF II'
+  when fund = 'Yield Spectrum' then 'YS ICAV'
+  when fund = 'YS LUX MASTER' then 'YS LUX'
+  when fund = 'YS PEER LP' then 'YS PEER'
+  when fund = 'E-OC' then 'OCEP'
+  else fund
+  end as Fund,
+
+  Issuer, Ending_Accrual_Book as 'Previous_AI', Code_Name
+  FROM [EnterpriseDatawarehouse].[xxx]
+
+  where Period_End_Date = '{Previous_Enddate}'
+  and Issuer not in('','Unrealized','Total Portfolio','Fully Realized') and
+  ([Geneva_Portfolio] <> 'STABL' and [Geneva_Portfolio] <> 'STABLS' and 
+  [Geneva_Portfolio] <> 'WO NDT' and [Geneva_Portfolio] <> 'WOIF' and 
+  [Geneva_Portfolio] <> 'WOSF_Family' and [Geneva_Portfolio] <> 'WOYSV_Family' and 
+  [Geneva_Portfolio] <> 'WO_Loan_Comp_Group' and [Geneva_Portfolio] <> 'YS_Family' and 
+  [Geneva_Portfolio] <> 'ZION_Group')
+;""", database_con)
+
+# print(Previous_AI)
+#
+Current_AI = pd.read_sql_query(f"""SELECT Ending_Accrual_Book as 'Current_AI', Code_Name, Fund
+  FROM [EnterpriseDatawarehouse].[xxx]
+
+  where Period_End_Date = '{Current_Enddate}' 
+  and Issuer not in('','Unrealized','Total Portfolio','Fully Realized') and
+  ([Geneva_Portfolio] <> 'STABL' and [Geneva_Portfolio] <> 'STABLS' and 
+  [Geneva_Portfolio] <> 'WO NDT' and [Geneva_Portfolio] <> 'WOSF_Family' 
+  and [Geneva_Portfolio] <> 'WOYSV_Family' 
+  and [Geneva_Portfolio] <> 'WO_Loan_Comp_Group' 
+  and [Geneva_Portfolio] <> 'YS_Family' and [Geneva_Portfolio] <> 'ZION_Group')
+;""", database_con)
+
+
+Change_in_AI = Current_AI.merge(Previous_AI, how = 'left', on = ['Fund','Code_Name'])
+Change_in_AI = Change_in_AI.rename(columns = {'Code_Name':'IssuerCode'})
+Change_in_AI = Change_in_AI.merge(Borrower_Master, how = 'left', on = 'IssuerCode')
+Change_in_AI = Change_in_AI.drop(columns = ['IssuerCode'])
+Change_in_AI['Change in AI'] = Change_in_AI['Current_AI'] - Change_in_AI['Previous_AI']
+
+# print(Change_in_AI)
+
+# Joining repayments data to Recon
+
+Repayments = Repayments.rename(columns = {'Portfolio':'Fund'})
+Repayments = Repayments.rename(columns = {'Code_Name_Clean':'Code_Name'})
+Repayments = Repayments.drop(columns = {'Date'})
+RP_Recon = RP_Recon.merge(Repayments, how='left', on=['Fund','Code_Name'])
+RP_Recon['Repayments'] = RP_Recon['Repayments'].fillna(0)
+RP_Recon['Interest & Fees'] = RP_Recon['RP_delta'] - RP_Recon['Repayments']
+RP_Recon['RP_Check'] = RP_Recon['Interest & Fees']/RP_Recon['Previous_FMV']
+RP_Recon['RP_Check'].loc[RP_Recon['Previous_FMV']==0] = 0
+RP_Recon.loc[:,"RP_Review?"] = ''
+RP_Recon['RP_Review?'].loc[RP_Recon['RP_Check'] > .03] = 'Yes'
+RP_Recon['RP_Review?'].loc[RP_Recon['RP_Check'] < .01] = 'Yes'
+RP_Recon['RP_Review?'] = RP_Recon['RP_Review?'].replace('','No')
+
+RP_Recon.loc[:,'RP_Notes'] = ''
+
+RP_Recon['RP_Notes'].loc[(RP_Recon['Realized'] == "Yes") & (RP_Recon['RP_Review?'] == "Yes") & (RP_Recon['RP_Check'] == 0)] = 'Realized'
+
+
+RP_Recon['RP_Notes'].loc[(RP_Recon['RP_Review?'] == "Yes") & (RP_Recon['Start_Date'] > Previous_Enddate) & (RP_Recon['RP_Notes'] == '')] = 'New this quarter'
+# Repayments.to_csv(r'xxx', index=False)
+
+# # Grabbing non accrual data from taxlot:
+Non_Accrual = pd.read_sql_query(f"""select a.Fund_Name, b.Restructured_Code_Name,  sum(a.Amortized_Cost) as 'non-accrual_cost', isnull(c.Amortized_cost,0) as 'Amortized_Cost'
+
+FROM [EnterpriseDatawarehouse].[xxx]a
+
+left join [EnterpriseDatawarehouse].[xxx] b on a.Code_Name=b.Code_Name
+
+left join (select Fund_Name, b.Restructured_Code_Name, sum(Amortized_Cost) as 'Amortized_cost'
+FROM [EnterpriseDatawarehouse].[xxx] a
+left join EnterpriseDatawarehouse.xxx b
+on a.Code_Name = b.Code_Name
+where Cap_Stack <> 'Equity and Warrants' and PeriodEndDate = '{Current_Enddate}' and Amortized_Cost <> 0.00
+group by Fund_Name,Restructured_Code_Name)c
+
+on b.Restructured_Code_Name=c.Restructured_Code_Name and a.Fund_Name = c.Fund_Name
+
+where a.Cap_Stack <> 'Equity and Warrants' and a.PeriodEndDate = '{Current_Enddate}' and a.Non_Accrual = 'y'
+
+group by a.Fund_Name, b.Restructured_Code_Name, c.Amortized_cost
+
+order by a.Fund_Name, b.Restructured_Code_Name
+;""", database_con)
+
+Non_Accrual['Fund_Name'] = Non_Accrual['Fund_Name'].replace('YS PEER LP','YS PEER')
+Non_Accrual['Fund_Name'] = Non_Accrual['Fund_Name'].replace('WOSPF LP','WOSPF')
+Non_Accrual['Fund_Name'] = Non_Accrual['Fund_Name'].replace('YS TERM LP','YS ICAV')
+Non_Accrual['Fund_Name'] = Non_Accrual['Fund_Name'].replace('YS REV LP','YS ICAV')
+Non_Accrual['Fund_Name'] = Non_Accrual['Fund_Name'].replace('WOS EU REV','WOS EU')
+Non_Accrual['Fund_Name'] = Non_Accrual['Fund_Name'].replace('WOS EU TERM','WOS EU')
+Non_Accrual['Fund_Name'] = Non_Accrual['Fund_Name'].replace('WOSF TERM','WOSF')
+Non_Accrual['Fund_Name'] = Non_Accrual['Fund_Name'].replace('WOSF REV','WOSF')
+Non_Accrual['Fund_Name'] = Non_Accrual['Fund_Name'].replace('WOSPF II LP','WOSPF II')
+Non_Accrual['Fund_Name'] = Non_Accrual['Fund_Name'].replace('E-OC','OCEP')
+
+Non_Accrual = Non_Accrual.groupby(['Fund_Name','Restructured_Code_Name']).agg({'non-accrual_cost':'sum','Amortized_Cost':'sum'})
+Non_Accrual = Non_Accrual.reset_index()
+
+# Grabbing RP from IRRquarterendcashflow for RP recon:
+
+RP_check = pd.read_sql_query(f"""SELECT distinct c.Fund,c.Code_Name, sum(c.flows) as 'flows_summed', isnull(a.Buys_BookValue,0) as 'Buys_BookValue', isnull(b.Buy_Quantity,0) as 'Buy_Quantity',
+(sum(c.flows) + isnull(a.Buys_BookValue,0) + isnull(b.Buy_Quantity,0)) as 'RP'
+  FROM [EnterpriseDatawarehouse].[xxx]c
+
+left join
+
+(SELECT distinct  Fund,Code_Name, sum(Buys_BookValue) as 'Buys_BookValue'
+  FROM [EnterpriseDatawarehouse].[xxx]
+where Period_End_Date = '{Current_Enddate}'  and ADate > '2020-9-30'
+group by Fund,Code_Name)a
+
+on c.Code_Name=a.Code_Name and c.Fund = a.Fund
+
+left join
+
+(SELECT distinct Fund,Code_Name, sum(d.Buy_Quantity) as 'Buy_Quantity'
+  FROM [EnterpriseDatawarehouse].[xxx]d
+where Period_End_Date = '{Current_Enddate}'  and ADate <= '2020-9-30'
+group by Fund,Code_Name)b
+
+on c.Code_Name = b.Code_Name and c.Fund = b.Fund
+
+where c.Period_End_Date = '{Current_Enddate}' 
+group by c.Fund,c.Code_Name, a.Buys_BookValue, b.Buy_Quantity
+order by c.Fund,c.Code_Name
+
+;""", database_con)
+RP_check = RP_check.rename(columns = {'Code_Name':'IssuerCode'})
+
+RP_check = RP_check.merge(Borrower_Master, how = 'left', on = ['IssuerCode'])
+
+RP_check['Fund'] = RP_check['Fund'].replace('Yield Spectrum_Group','YS ICAV')
+
+
+
+
+RP_check = RP_check.drop(columns=['flows_summed','Buy_Quantity','Buys_BookValue','IssuerCode'])
+RP_check = RP_check.rename(columns = {'Restructured_Code_Name':'Code_Name'})
+RP_check = RP_check.groupby(['Fund','Code_Name'])['RP'].sum()
+RP_check = RP_check.reset_index()
+
+
+
+RP_Topsides = pd.read_sql_query(f"""SELECT [PortfolioClean] as 'Fund'
+      ,[Code_Name]
+      ,[Buys]
+
+  FROM [EnterpriseDatawarehouse].[xxx]
+;""", database_con)
+
+RP_Topsides['Code_Name'] = RP_Topsides['Code_Name'].astype(str)
+RP_Topsides['Code_Name'] = RP_Topsides['Code_Name'].apply(str.upper)
+RP_Topsides['Code_Name'] = RP_Topsides['Code_Name'].str.strip()
+RP_Topsides['Fund'] = RP_Topsides['Fund'].astype(str)
+RP_Topsides['Fund'] = RP_Topsides['Fund'].apply(str.upper)
+RP_Topsides['Fund'] = RP_Topsides['Fund'].str.strip()
+RP_Topsides = RP_Topsides.groupby(['Fund','Code_Name'])['Buys'].apply(sum)
+
+RP_Topsides = RP_Topsides.reset_index()
+
+RP_check['Code_Name'] = RP_check['Code_Name'].str.upper()
+RP_check['Code_Name'] = RP_check['Code_Name'].str.strip()
+
+RP_Recon = RP_Recon.merge(RP_Topsides, how = 'left', on = ['Fund','Code_Name'])
+# print(RP_Recon)
+
+RP_Recon = RP_Recon.merge(RP_check, how = 'left', on = ['Fund','Code_Name'])
+
+
+# print(RP_Recon)
+RP_Recon['Buys'] = RP_Recon['Buys'].fillna(0)
+RP_Recon['RP'] = RP_Recon['RP'].fillna(0)
+RP_Recon['Adjusted_Current_RP'] = RP_Recon['Buys']+RP_Recon['RP']
+RP_Recon = RP_Recon.drop(columns = ['Buys','RP'])
+RP_Recon['Current_RP_delta'] = (RP_Recon['Adjusted_Current_RP'] - RP_Recon['Realized_Proceeds']).round(decimals = 0)
+
+
+Non_Accrual_for_join = Non_Accrual.groupby(['Fund_Name','Restructured_Code_Name']).agg({'non-accrual_cost':'sum','Amortized_Cost':'sum'})
+Non_Accrual_for_join = Non_Accrual_for_join.reset_index()
+Non_Accrual_for_join['non-accrual_cost'] = Non_Accrual_for_join['non-accrual_cost'].astype(float)
+Non_Accrual_for_join['Amortized_Cost'] = Non_Accrual_for_join['Amortized_Cost'].astype(float)
+Non_Accrual_for_join['Non_Accrual_Rate'] = Non_Accrual_for_join['non-accrual_cost']/Non_Accrual_for_join['Amortized_Cost']
+# Non_Accrual_for_join .to_csv(r'xxx', index=False)
+Non_Accrual_for_join = Non_Accrual_for_join.rename(columns = {'Restructured_Code_Name':'Code_Name','Fund_Name':'Fund'})
+Non_Accrual_for_join = Non_Accrual_for_join.drop(columns = ['non-accrual_cost','Amortized_Cost'])
+
+RP_Recon = RP_Recon.merge(Non_Accrual_for_join, how = 'left', on = ['Fund','Code_Name'])
+RP_Recon['Non_Accrual_Rate'] = RP_Recon['Non_Accrual_Rate'].fillna(0)
+# RP_Recon.to_csv(r'xxx', index=False)
+RP_Recon['RP_Notes'].loc[(RP_Recon['RP_Review?'] == "Yes") & (RP_Recon['Non_Accrual_Rate'] > .7) & (RP_Recon['RP_Notes'] == '') & (RP_Recon['RP_Check'] > .005)] = 'On non-accrual but needs further review'
+RP_Recon['RP_Notes'].loc[(RP_Recon['RP_Review?'] == "Yes") & (RP_Recon['Non_Accrual_Rate'] > .7) & (RP_Recon['RP_Notes'] == '')] = 'On non-accrual'
+RP_Recon['RP_Notes'].loc[(RP_Recon['RP_Review?'] == "Yes") & (RP_Recon['Non_Accrual_Rate'] < .7) & (RP_Recon['Non_Accrual_Rate'] > .1) & (RP_Recon['RP_Notes'] == '')] = 'partial non-accrual'
+RP_Recon['RP_Notes'].loc[(RP_Recon['RP_Review?'] == "Yes") & (RP_Recon['Current_RP_delta'] < 1000) & (RP_Recon['RP_Notes'] == '') & (RP_Recon['RP_Check'] > .15)] = 'Realized Proceeds are correct but needs further review'
+RP_Recon['RP_Notes'].loc[(RP_Recon['RP_Review?'] == "Yes") & (RP_Recon['Current_RP_delta'] < 1000) & (RP_Recon['RP_Notes'] == '') & (RP_Recon['RP_Check'] < -.001)] = 'Realized Proceeds are correct but needs further review'
+RP_Recon['RP_Notes'].loc[(RP_Recon['RP_Review?'] == "Yes") & (RP_Recon['Current_RP_delta'] < 1000) & (RP_Recon['RP_Notes'] == '')] = 'Realized Proceeds are correct'
+RP_Recon['RP_Notes'].loc[(RP_Recon['RP_Review?'] == "Yes") & (RP_Recon['Current_RP_delta'] > 1000) & (RP_Recon['RP_Notes'] == '')] = 'Realized Proceeds are incorrect, needs further review'
+RP_Recon['RP_Notes'].loc[(RP_Recon['RP_Review?'] == "Yes") & (RP_Recon['RP_Notes'] == '')] = 'Realized Proceeds are incorrect, needs further review'
+# RP_Recon.to_csv(r'xxx', index=False)
+
+# Pulling in Buys, Repayments, and change in valuation data for FMV recon
+Buys = Buys.rename(columns = {'Code Name Clean':'Code_Name'})
+Buys = Buys.drop(columns = ['Date'])
+Change_in_AI = Change_in_AI.rename(columns = {'Restructured_Code_Name':'Code_Name'})
+Change_in_AI = Change_in_AI.drop(columns = ['Issuer'])
+Change_in_Valuation = Change_in_Valuation.rename(columns = {'Current_FMV':'Current_FMV_taxlot','FMV':'Previous_FMV_taxlot'})
+
+# Change_in_Valuation = Change_in_Valuation.drop(columns = ['Current_FMV','FMV'])
+# Change_in_Valuation.to_csv(r'xxx', index=False)
+
+
+# print(Buys)
+# print(Change_in_AI)
+# print(Change_in_Valuation)
+
+Buys = Buys.rename(columns = {'Portfolio':'Fund'})
+Change_in_Valuation = Change_in_Valuation.rename(columns = {'Portfolio':'Fund'})
+
+RP_Recon = RP_Recon.merge(Buys, how = 'left', on = ['Fund','Code_Name'])
+RP_Recon = RP_Recon.merge(Change_in_AI, how = 'left', on = ['Fund','Code_Name'])
+RP_Recon = RP_Recon.merge(Change_in_Valuation, how = 'left', on = ['Fund','Code_Name'])
+RP_Recon['Buys'] = RP_Recon['Buys'].fillna(0)
+RP_Recon['Previous_AI'] = RP_Recon['Previous_AI'].fillna(0)
+RP_Recon['Change in AI'] = RP_Recon['Change in AI'].fillna(0)
+# # RP_Recon['Change in AI'].loc[RP_Recon['Code_Name'] == 'BYTE'] = 0
+# # RP_Recon['Change in AI'].loc[RP_Recon['Code_Name'] == 'ROYALS'] = 0
+# # RP_Recon['Change in AI'].loc[RP_Recon['Code_Name'] == 'GEODE'] = 0
+# # RP_Recon['Change in AI'].loc[RP_Recon['Realized'] == 'Yes'] = 0
+RP_Recon['Change_in_FMV'] = RP_Recon['Change_in_FMV'].fillna(0)
+#
+RP_Recon['Fundings & Repayments'] = RP_Recon['Buys'] - RP_Recon['Repayments']
+RP_Recon['Valuation_and_AI_Change'] = (RP_Recon['Change in AI'] + RP_Recon['Change_in_FMV'])-RP_Recon['Fundings & Repayments']
+RP_Recon['Expected_Current_FMV'] = RP_Recon['Previous_FMV'] + RP_Recon['Fundings & Repayments'] + RP_Recon['Valuation_and_AI_Change']
+RP_Recon['Expected_vs_Actual_FMV_delta'] = RP_Recon['Fair_Market_Value'] - RP_Recon['Expected_Current_FMV']
+RP_Recon['FMV_Delta_Stress_Test'] = RP_Recon['Expected_vs_Actual_FMV_delta']/RP_Recon['Previous_FMV']
+RP_Recon['FMV_Delta_Stress_Test'].loc[RP_Recon['Previous_FMV'] == 0] = 0
+RP_Recon['IRR_Report_FMV_Delta'] = RP_Recon['Fair_Market_Value'] - RP_Recon['Previous_FMV']
+RP_Recon['IRR_Taxlot_QoQ_delta'] = RP_Recon['IRR_Report_FMV_Delta'] - RP_Recon['Change_in_FMV'] - RP_Recon['Change in AI']
+RP_Recon.loc[:,'FMV_Review?'] = ''
+RP_Recon['FMV_Review?'].loc[RP_Recon['FMV_Delta_Stress_Test']>.01] = 'Yes'
+RP_Recon['FMV_Review?'].loc[RP_Recon['FMV_Delta_Stress_Test']<-.01] = 'Yes'
+RP_Recon['FMV_Review?'].loc[RP_Recon['Current_AI']<-100000] = 'Yes'
+
+RP_Recon['FMV_Review?'] = RP_Recon['FMV_Review?'].replace('','No')
+
+
+# pulling in
+# Current_AI = pd.read_sql_query(f"""SELECT Issuer, Ending_Accrual_Book as 'Current_AI', Code_Name
+#   FROM [EnterpriseDatawarehouse].[xxx]
+#
+#   where Period_End_Date = '{Current_Enddate}' and Geneva_Portfolio = 'WO_Loan_Comp_Group'
+#   and Issuer not in('','Unrealized','Total Portfolio','Fully Realized')
+# ;""", database_con)
+RP_Recon.loc[:,'FMV_Notes'] = ''
+RP_Recon['FMV_Notes'].loc[(RP_Recon['FMV_Review?'] == 'Yes') & (RP_Recon['RealizationDate'] > Previous_Enddate)] = 'Realized in recent quarter'
+RP_Recon['FMV_Notes'].loc[(RP_Recon['RealizationDate'] > Previous_3_Enddate) & (RP_Recon['RealizationDate'] <= Previous_2_Enddate) & (RP_Recon['FMV_Review?'] == 'Yes') & (RP_Recon['FMV_Notes'] == '')] = 'Needs review'
+RP_Recon['FMV_Notes'].loc[(RP_Recon['IRR_Taxlot_QoQ_delta'].abs() > 2000) & (RP_Recon['FMV_Review?'] == 'Yes') & (RP_Recon['FMV_Notes'] == '')] = 'Current and previous Q FMV discrepancies between pricing and taxlot/needs review'
+RP_Recon['FMV_Notes'].loc[(RP_Recon['Current_AI'] < -100000) & (RP_Recon['FMV_Notes'] == '') & (RP_Recon['FMV_Review?'] == 'Yes') & (RP_Recon['Realized'] == 'Yes')] = 'Negative AI on realized position'
+RP_Recon['FMV_Notes'].loc[(RP_Recon['Current_AI'] < -100000) & (RP_Recon['FMV_Notes'] == '') & (RP_Recon['FMV_Review?'] == 'Yes') & (RP_Recon['Realized'] == 'No')] = 'Negative AI/Needs review '
+RP_Recon['FMV_Notes'].loc[(RP_Recon['FMV_Review?'] == 'Yes') & (RP_Recon['FMV_Notes'] == '')] = 'Needs review'
+# RP_Recon.to_csv(r'xxx', index=False)
+
+
+RP_Recon['Current_IRR'] = RP_Recon['Current_IRR'].fillna(0)
+RP_Recon['Previous_IRR'] = RP_Recon['Previous_IRR'].fillna(0)
+
+RP_Recon['Change_in_GL'] = RP_Recon['Current_Gain_Loss'] - RP_Recon['Previous_Gain_Loss']
+RP_Recon['Expected_Quarterly_Return'] = (RP_Recon['Change_in_GL']/RP_Recon['Previous_FMV'])*4
+RP_Recon['Expected_Quarterly_Return'].loc[RP_Recon['Previous_FMV'] == 0] = 0
+RP_Recon['IRR_Delta'] = RP_Recon['Current_IRR'] - RP_Recon['Previous_IRR']
+
+RP_Recon['Current_FMV_taxlot'] = RP_Recon['Current_FMV_taxlot'].fillna(0)
+RP_Recon['Previous_FMV_taxlot'] = RP_Recon['Previous_FMV_taxlot'].fillna(0)
+RP_Recon['Change_in_FMV'] = RP_Recon['Change_in_FMV'].fillna(0)
+RP_Recon['IRR_Notes'] = ''
+RP_Recon['IRR_Needs_Review?'] = ''
+RP_Recon['IRR_Needs_Review?'].loc[(RP_Recon['IRR_Delta'].abs()>.01)] = 'Yes'
+RP_Recon['IRR_Needs_Review?'].loc[(RP_Recon['IRR_Delta'].abs()<=.01)] = 'No'
+RP_Recon['IRR_Notes'].loc[(RP_Recon['Change_in_GL'] < 0) & (RP_Recon['IRR_Delta'] < 0) & (RP_Recon['IRR_Needs_Review?'] == 'Yes') ] = 'Decrease in G/L'
+RP_Recon['IRR_Notes'].loc[(RP_Recon['Change_in_GL'] > 0) & (RP_Recon['IRR_Delta'] > 0) & (RP_Recon['IRR_Notes'] == '') & (RP_Recon['IRR_Needs_Review?'] == 'Yes')] = 'Increase in G/L'
+RP_Recon['IRR_Notes'].loc[(RP_Recon['Change_in_GL'] > 0) & (RP_Recon['IRR_Delta'] < 0) & (RP_Recon['IRR_Notes'] == '') & (RP_Recon['IRR_Needs_Review?'] == 'Yes')
+                          &(RP_Recon['Current_IRR'] < RP_Recon['Previous_IRR']) & (RP_Recon['Expected_Quarterly_Return'] < RP_Recon['Current_IRR'])] = 'Increase in G/L offset by time value of money'
+RP_Recon['IRR_Notes'].loc[(RP_Recon['Change_in_GL'] < 0) & (RP_Recon['IRR_Delta'] > 0) & (RP_Recon['IRR_Notes'] == '') & (RP_Recon['IRR_Needs_Review?'] == 'Yes')
+                          &(RP_Recon['Current_IRR'] > RP_Recon['Previous_IRR']) & (RP_Recon['Expected_Quarterly_Return'] > RP_Recon['Current_IRR'])] = 'Decrease in G/L offset by time value of money'
+RP_Recon['IRR_Notes'].loc[(RP_Recon['IRR_Notes'] == '') & (RP_Recon['IRR_Needs_Review?'] == 'Yes')] = 'Needs review'
+
+
+# Cash Yield Recon
+
+RP_Recon['Previous_Cash_Yield'] = RP_Recon['Previous_Cash_Yield'].fillna(0)
+RP_Recon['Previous_Gross_Multiple'] = RP_Recon['Previous_Gross_Multiple'].fillna(0)
+
+
+
+RP_Recon['QoQ Gross Multiple Delta'] = RP_Recon['Current_Gross_Multiple'] - RP_Recon['Previous_Gross_Multiple']
+RP_Recon['QoQ Cash Yield Delta'] = RP_Recon['Current_Cash_Yield'] - RP_Recon['Previous_Cash_Yield']
+
+# Pulling in PIK data from taxlot
+
+Taxlot_PIK = pd.read_sql_query(f"""select b.Fund_Name as Fund, b.Restructured_Code_Name as Code_Name, isnull(b.PIK_Current/100,0) as PIK_Current, isnull(c.PIK_Previous/100,0) as PIK_Previous
+
+from
+
+(SELECT Fund_Name, e.Restructured_Code_Name, ((sum(PIK_Interest*Quantity))/(sum(quantity))) as PIK_Current
+  FROM [EnterpriseDatawarehouse].[xxx]a
+  left join
+  [EnterpriseDatawarehouse].[xxx]e
+
+  on a.Code_Name = e.Code_Name
+  where PeriodEndDate = '{Current_Enddate}' and Cap_Stack <> 'Equity and Warrants'
+  group by a.Fund_Name, e.Restructured_Code_Name)b
+
+
+  left join
+
+
+  (SELECT Fund_Name, e.Restructured_Code_Name, ((sum(PIK_Interest*Quantity))/(sum(quantity))) as PIK_Previous
+  FROM [EnterpriseDatawarehouse].[xxx]a
+  left join
+  [EnterpriseDatawarehouse].[xxx]e
+
+  on a.Code_Name = e.Code_Name
+  where PeriodEndDate = '{Previous_Enddate}' and Cap_Stack <> 'Equity and Warrants'
+  group by a.Fund_Name, e.Restructured_Code_Name)c
+
+  on b.Fund_Name = c.Fund_Name and b.Restructured_Code_Name = c.Restructured_Code_Name
+
+  order by b.Restructured_Code_Name, b.Fund_Name
+;""", database_con)
+Taxlot_PIK['Fund'] = Taxlot_PIK['Fund'].replace('YS PEER LP','YS PEER')
+Taxlot_PIK['Fund'] = Taxlot_PIK['Fund'].replace('YS LUX MASTER', 'YS LUX')
+Taxlot_PIK['Fund'] = Taxlot_PIK['Fund'].replace('WOSPF LP', 'WOSPF')
+Taxlot_PIK['Fund'] = Taxlot_PIK['Fund'].replace('YS TERM LP', 'YS ICAV')
+Taxlot_PIK['Fund'] = Taxlot_PIK['Fund'].replace('YS REV LP', 'YS ICAV')
+Taxlot_PIK['Fund'] = Taxlot_PIK['Fund'].replace('WOS EU REV', 'WOS EU')
+Taxlot_PIK['Fund'] = Taxlot_PIK['Fund'].replace('WOS EU TERM', 'WOS EU')
+Taxlot_PIK['Fund'] = Taxlot_PIK['Fund'].replace('WOSF TERM', 'WOSF')
+Taxlot_PIK['Fund'] = Taxlot_PIK['Fund'].replace('WOSF REV', 'WOSF')
+Taxlot_PIK['Fund'] = Taxlot_PIK['Fund'].replace('WOSPF II LP', 'WOSPF II')
+Taxlot_PIK['Fund'] = Taxlot_PIK['Fund'].replace('E-OC', 'OCEP')
+
+Taxlot_Cashrate = pd.read_sql_query(f"""select b.Fund_Name as Fund, b.Restructured_Code_Name as Code_Name, isnull(b.Cashrate_Current/100,0) as Cashrate_Current, isnull(c.Cashrate_Previous/100,0) as Cashrate_Previous
+
+from
+
+(SELECT a.Fund_Name, e.Restructured_Code_Name, ((sum(f.Cash_Rate_Updated*updated_quantity))/(sum(updated_quantity))) as Cashrate_Current
+  FROM [EnterpriseDatawarehouse].[xxx]a
+  left join
+  [EnterpriseDatawarehouse].[xxx]e
+
+  on a.Code_Name = e.Code_Name
+
+ left join
+
+
+  (SELECT Fund_Name, e.Restructured_Code_Name, case when Non_Accrual = 'y' then 0 else Cash_Rate end as Cash_Rate_Updated, sum(quantity) as updated_quantity
+  FROM [EnterpriseDatawarehouse].[xxx]a
+  left join
+  [EnterpriseDatawarehouse].[xxx]e
+
+  on a.Code_Name = e.Code_Name
+  where PeriodEndDate = '{Current_Enddate}' and Cap_Stack <> 'Equity and Warrants'
+  group by a.Fund_Name, e.Restructured_Code_Name, Cash_Rate, Non_Accrual)f
+
+
+ on e.Restructured_Code_Name = f.Restructured_Code_Name and a.Fund_Name = f.Fund_Name
+
+   where PeriodEndDate = '{Current_Enddate}' and Cap_Stack <> 'Equity and Warrants'
+
+ group by a.Fund_Name, e.Restructured_Code_Name)b
+
+  left join
+
+  (SELECT a.Fund_Name, e.Restructured_Code_Name, ((sum(f.Cash_Rate_Updated*updated_quantity))/(sum(updated_quantity))) as Cashrate_Previous
+  FROM [EnterpriseDatawarehouse].[xxx]a
+  left join
+  [EnterpriseDatawarehouse].[xxx]e
+
+  on a.Code_Name = e.Code_Name
+
+ left join
+
+
+  (SELECT Fund_Name, e.Restructured_Code_Name, case when Non_Accrual = 'y' then 0 else Cash_Rate end as Cash_Rate_Updated, sum(quantity) as updated_quantity
+  FROM [EnterpriseDatawarehouse].[xxx]a
+  left join
+  [EnterpriseDatawarehouse].[xxx]e
+
+  on a.Code_Name = e.Code_Name
+  where PeriodEndDate = '{Previous_Enddate}' and Cap_Stack <> 'Equity and Warrants'
+  group by a.Fund_Name, e.Restructured_Code_Name, Cash_Rate, Non_Accrual)f
+
+
+ on e.Restructured_Code_Name = f.Restructured_Code_Name and a.Fund_Name = f.Fund_Name
+
+   where PeriodEndDate = '{Previous_Enddate}' and Cap_Stack <> 'Equity and Warrants'
+
+ group by a.Fund_Name, e.Restructured_Code_Name)c
+
+  on b.Fund_Name = c.Fund_Name and b.Restructured_Code_Name = c.Restructured_Code_Name
+
+  order by b.Restructured_Code_Name, b.Fund_Name
+;""", database_con)
+
+Taxlot_Cashrate['Fund'] = Taxlot_Cashrate['Fund'].replace('YS PEER LP', 'YS PEER')
+Taxlot_Cashrate['Fund'] = Taxlot_Cashrate['Fund'].replace('YS LUX MASTER', 'YS LUX')
+Taxlot_Cashrate['Fund'] = Taxlot_Cashrate['Fund'].replace('WOSPF LP', 'WOSPF')
+Taxlot_Cashrate['Fund'] = Taxlot_Cashrate['Fund'].replace('YS TERM LP', 'YS ICAV')
+Taxlot_Cashrate['Fund'] = Taxlot_Cashrate['Fund'].replace('YS REV LP', 'YS ICAV')
+Taxlot_Cashrate['Fund'] = Taxlot_Cashrate['Fund'].replace('WOS EU REV', 'WOS EU')
+Taxlot_Cashrate['Fund'] = Taxlot_Cashrate['Fund'].replace('WOS EU TERM', 'WOS EU')
+Taxlot_Cashrate['Fund'] = Taxlot_Cashrate['Fund'].replace('WOSF TERM', 'WOSF')
+Taxlot_Cashrate['Fund'] = Taxlot_Cashrate['Fund'].replace('WOSF REV', 'WOSF')
+Taxlot_Cashrate['Fund'] = Taxlot_Cashrate['Fund'].replace('WOSPF II LP', 'WOSPF II')
+Taxlot_Cashrate['Fund'] = Taxlot_Cashrate['Fund'].replace('E-OC', 'OCEP')
+
+RP_Recon = RP_Recon.merge(Taxlot_PIK, on = ['Fund','Code_Name'], how = 'left')
+RP_Recon = RP_Recon.merge(Taxlot_Cashrate, on = ['Fund','Code_Name'], how = 'left')
+RP_Recon['Cashrate_Current'] = RP_Recon['Cashrate_Current'].fillna(0)
+RP_Recon['Cashrate_Previous'] = RP_Recon['Cashrate_Previous'].fillna(0)
+RP_Recon['IRR_Delta'] = RP_Recon['IRR_Delta'].fillna(0)
+RP_Recon['PIK_Current'] = RP_Recon['PIK_Current'].fillna(0)
+RP_Recon['PIK_Previous'] = RP_Recon['PIK_Previous'].fillna(0)
+
+
+
+
+
+RP_Recon['PIK Delta'] = (RP_Recon['PIK_Current'] - RP_Recon['PIK_Previous']).abs()
+RP_Recon['PIK Delta'] = RP_Recon['PIK Delta'].fillna(0)
+RP_Recon ['CurrentCashrate_delta'] = (RP_Recon['Current_Cash_Yield'] - RP_Recon['Cashrate_Current']).abs()
+RP_Recon['QoQ Cash Rate and PIK Delta (absolute)'] = (RP_Recon['PIK Delta'] - RP_Recon['QoQ Cash Yield Delta'].abs()).abs()
+RP_Recon['QoQ Cash Rate and PIK Delta (absolute)'] = RP_Recon['QoQ Cash Rate and PIK Delta (absolute)'].fillna(0)
+RP_Recon['Cash Yield Review?'] = ''
+RP_Recon['Cash Yield Review?'].loc[RP_Recon['QoQ Cash Yield Delta'] >= .01] = 'Yes'
+RP_Recon['Cash Yield Review?'].loc[RP_Recon['QoQ Cash Yield Delta'] <= -.01] = 'Yes'
+RP_Recon['Cash Yield Review?'] = RP_Recon['Cash Yield Review?'].replace('','No')
+RP_Recon['Notes on Cash Yield Delta'] = ''
+RP_Recon['Notes on Cash Yield Delta'].loc[(RP_Recon['Cash Yield Review?'] == 'Yes') & (RP_Recon['QoQ Cash Yield Delta'] <= -.01) & (RP_Recon['Realized'] == 'Yes')] = 'Realized'
+RP_Recon['Notes on Cash Yield Delta'].loc[(RP_Recon['Cash Yield Review?'] == 'Yes') & (RP_Recon['QoQ Cash Yield Delta'] >= .01) & (RP_Recon['Start_Date'] > Previous_Enddate)] = 'New this quarter'
+RP_Recon['Notes on Cash Yield Delta'].loc[(RP_Recon['Cash Yield Review?'] == 'Yes') & (RP_Recon['Notes on Cash Yield Delta'] == '') & (RP_Recon['QoQ Cash Rate and PIK Delta (absolute)'] < .01 ) & (RP_Recon['PIK_Current'] != 0)] = 'Moved to PIK'
+RP_Recon['Notes on Cash Yield Delta'].loc[(RP_Recon['Cash Yield Review?'] == 'Yes') & (RP_Recon['Notes on Cash Yield Delta'] == '') & (RP_Recon['QoQ Cash Rate and PIK Delta (absolute)'] > .01 ) & (RP_Recon['PIK_Current'] != 0)] = 'Moved to PIK but needs review'
+RP_Recon['Notes on Cash Yield Delta'].loc[(RP_Recon['Cash Yield Review?'] == 'Yes') & (RP_Recon['Notes on Cash Yield Delta'] == '') & (RP_Recon['Cashrate_Current'] == RP_Recon['Current_Cash_Yield'])] = 'New this quarter'
+RP_Recon['Notes on Cash Yield Delta'].loc[(RP_Recon['Cash Yield Review?'] == 'Yes') & (RP_Recon['Notes on Cash Yield Delta'] == '') & (RP_Recon['CurrentCashrate_delta'] < .0001)] = 'Cash Yield is correct'
+RP_Recon['Notes on Cash Yield Delta'].loc[(RP_Recon['Cash Yield Review?'] == 'Yes') & (RP_Recon['Notes on Cash Yield Delta'] == '')] = 'Needs review'
+RP_Recon = RP_Recon.drop(columns = ['CurrentCashrate_delta'])
+
+RP_Recon['TOC_Previous'] = RP_Recon['TOC_Previous'].fillna(0)
+RP_Recon['QoQ_TOC_Delta'] = RP_Recon['TOC_Current'] - RP_Recon['TOC_Previous']
+RP_Recon['TOC_Expected_vs_Actual_Delta'] = RP_Recon['QoQ_TOC_Delta'] - RP_Recon['Buys']
+RP_Recon['TOC_Review?'] = ''
+RP_Recon['TOC_Review?'].loc[(RP_Recon['TOC_Expected_vs_Actual_Delta'].abs()>100)] = 'Yes'
+RP_Recon['TOC_Review?'].loc[RP_Recon['TOC_Review?'] == ''] = 'No'
+RP_Recon['TOC_Notes'] = ''
+RP_Recon['TOC_Notes'].loc[RP_Recon['TOC_Review?'] == 'Yes'] = 'Needs review/IRRCashflow and Ledger do not tie'
+
+RP_Recon=RP_Recon.loc[:,['Fund',
+'Code_Name',
+'Realized',
+'RealizationDate',
+'Start_Date',
+'TOC_Current',
+'TOC_Previous',
+'QoQ_TOC_Delta',
+'TOC_Expected_vs_Actual_Delta',
+'TOC_Review?',
+'TOC_Notes',
+'Realized_Proceeds',
+'Previous_Q_RP',
+'RP_delta',
+'Buys',
+'Repayments',
+'Interest & Fees',
+'Adjusted_Current_RP',
+'Current_RP_delta',
+'Non_Accrual_Rate',
+'RP_Check',
+'RP_Review?',
+'RP_Notes',
+'Fair_Market_Value',
+'Previous_FMV',
+'Current_AI',
+'Previous_AI',
+'Change in AI',
+'Current_FMV_taxlot',
+'Previous_FMV_taxlot',
+'Change_in_FMV',
+'Fundings & Repayments',
+'Valuation_and_AI_Change',
+'Expected_Current_FMV',
+'Expected_vs_Actual_FMV_delta',
+'FMV_Delta_Stress_Test',
+'IRR_Report_FMV_Delta',
+'IRR_Taxlot_QoQ_delta',
+'FMV_Review?',
+'FMV_Notes',
+'Current_Gain_Loss',
+'Previous_Gain_Loss',
+'Change_in_GL',
+'Current_IRR',
+'Previous_IRR',
+'IRR_Delta',
+'Expected_Quarterly_Return',
+'IRR_Needs_Review?',
+'IRR_Notes',
+'PIK_Current',
+'PIK_Previous',
+'PIK Delta',
+'QoQ Cash Rate and PIK Delta (absolute)',
+'Current_Gross_Multiple',
+'Previous_Gross_Multiple',
+'QoQ Gross Multiple Delta',
+'Current_Cash_Yield',
+'Previous_Cash_Yield',
+'Cashrate_Current',
+'Cashrate_Previous',
+'QoQ Cash Yield Delta',
+'Cash Yield Review?',
+'Notes on Cash Yield Delta'
+]]
+
+# RP_Recon.to_csv(r'xxx', index=False)
+
+TOC_tab = RP_Recon.query('TOC_Notes.str.contains("review")', engine = 'python')
+TOC_tab = TOC_tab[['Fund','Code_Name','TOC_Notes']]
+TOC_tab = TOC_tab.rename(columns = {'TOC_Notes':'Notes'})
+
+
+TOC_tab.loc[:,"Metric"] = 'Total Originated Capital'
+
+RP_tab = RP_Recon.query('RP_Notes.str.contains("review")', engine = 'python')
+RP_tab = RP_tab[['Fund','Code_Name','RP_Notes']]
+RP_tab = RP_tab.rename(columns = {'RP_Notes':'Notes'})
+RP_tab.loc[:,"Metric"] = 'Realized Proceeds'
+# print(RP_tab)
+
+FMV_tab = RP_Recon.query('FMV_Notes.str.contains("review")', engine = 'python')
+FMV_tab = FMV_tab[['Fund','Code_Name','FMV_Notes']]
+FMV_tab = FMV_tab.rename(columns = {'FMV_Notes':'Notes'})
+if FMV_tab.empty == False:
+    FMV_tab.loc[:,"Metric"] = 'FMV'
+else:
+    print('empty tab')
+
+IRR_tab = RP_Recon.query('IRR_Notes.str.contains("review")', engine = 'python')
+IRR_tab = IRR_tab[['Fund','Code_Name','IRR_Notes']]
+IRR_tab = IRR_tab.rename(columns = {'IRR_Notes':'Notes'})
+if IRR_tab.empty == False:
+    IRR_tab.loc[:,"Metric"] = 'IRR'
+else:
+    print("empty tab")
+
+RP_Recon = RP_Recon.rename(columns = {'QoQ Cash Yield Delta':'QoQ_Cash_Yield_Delta','Notes on Cash Yield Delta':'CashYield_Notes'})
+
+CashYield_tab = RP_Recon.query('CashYield_Notes.str.contains("review")', engine = 'python')
+CashYield_tab = CashYield_tab[['Fund','Code_Name','CashYield_Notes']]
+CashYield_tab = CashYield_tab.rename(columns = {'CashYield_Notes':'Notes'})
+
+if CashYield_tab.empty == False:
+    CashYield_tab.loc[:,"Metric"] = 'Cash Yield'
+else:
+    print("empty tab")
+
+Summary = pd.concat([TOC_tab, RP_tab, FMV_tab, IRR_tab, CashYield_tab])
+
+Summary = Summary.loc[:,['Fund','Code_Name','Metric','Notes']]
+Change_in_AI = Change_in_AI.loc[:,['Fund','Code_Name','Current_AI','Previous_AI','Change in AI']]
+Glossary = rf'xxx'
+Glossary = pd.read_excel(Glossary)
+
+with pd.ExcelWriter(r"xxx") as writer:
+    RP_Recon.to_excel(writer, sheet_name="Recon", index=False)
+    Current_Fund_Composite.to_excel(writer, sheet_name="Current_Fund_Composite", index=False)
+    Previous_Fund_Composite_pre.to_excel(writer, sheet_name="Previous_Fund_Composite", index=False)
+    Summary.to_excel(writer, sheet_name="Summary", index=False)
+    Buys.to_excel(writer, sheet_name="Buys", index=False)
+    Repayments.to_excel(writer, sheet_name="Repayments", index=False)
+    Change_in_AI.to_excel(writer, sheet_name="Change_and_AI", index=False)
+    Change_in_Valuation.to_excel(writer, sheet_name="Change_in_Valuation", index=False)
+    Glossary.to_excel(writer, sheet_name="Glossary", index=False)
