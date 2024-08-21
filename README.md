@@ -1,4 +1,4 @@
-**Project: **
+****Project: ****
 
 The Fund_Composite_Reconciliation.py script will reconcile the QoQ fund composite changes in total originated capital, realized proceeds, fair market value, investment IRR, and cash yield. For each of these areas of recon, deal will be tagged for further review if certain conditions are met. Below are descriptions of what occurs in each area of the script:
 
